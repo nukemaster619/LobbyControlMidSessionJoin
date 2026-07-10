@@ -1,3 +1,5 @@
+using System.Collections;
+using GameNetcodeStuff;
 using HarmonyLib;
 using Unity.Netcode;
 
@@ -51,18 +53,49 @@ internal static class Patches
     }
 
     [HarmonyPostfix]
-    [HarmonyPatch(typeof(StartOfRound), nameof(StartOfRound.OnPlayerConnectedClientRpc))]
-    private static void PlayerConnectedPostfix(StartOfRound __instance, ulong clientId)
+    [HarmonyPatch(typeof(StartOfRound), "Start")]
+    private static void StartOfRoundStartPostfix()
     {
-        if (__instance.IsServer && clientId != NetworkManager.ServerClientId)
-            NetworkSync.SendSnapshot(clientId);
+        WorldStateSync.RegisterHandler();
     }
 
     [HarmonyPostfix]
-    [HarmonyPatch(typeof(NetworkManager), nameof(NetworkManager.Initialize))]
-    private static void NetworkInitializePostfix() => NetworkSync.Register();
+    [HarmonyPatch(typeof(PlayerControllerB), "ConnectClientToPlayerObject")]
+    private static void ConnectClientToPlayerObjectPostfix()
+    {
+        WorldStateSync.RegisterHandler();
+    }
+
+    [HarmonyPostfix]
+    [HarmonyPatch(typeof(GameNetworkManager), "SetInstanceValuesBackToDefault")]
+    private static void ResetNetworkStatePostfix()
+    {
+        WorldStateSync.UnregisterHandler();
+        NetworkSync.ResetSynchronizations();
+        MidJoinState.ResetClientState();
+    }
 
     [HarmonyPrefix]
-    [HarmonyPatch(typeof(GameNetworkManager), "SetInstanceValuesBackToDefault")]
-    private static void NetworkShutdownPrefix() => NetworkSync.Unregister();
+    [HarmonyPriority(Priority.First)]
+    [HarmonyPatch(typeof(StartOfRound), "openingDoorsSequence")]
+    private static bool OpeningDoorsSequencePrefix(StartOfRound __instance, ref IEnumerator __result)
+    {
+        if (!Plugin.Enabled.Value || __instance.IsServer || !MidJoinState.ClientLateJoinSyncActive)
+            return true;
+
+        // FinishGeneratingNewLevelClientRpc normally starts this iterator. Running it for a
+        // late joiner replays OpenShip and the full landing delay after the moon is already active.
+        MidJoinState.LandingSequencesSuppressed++;
+        __result = WorldStateSync.RunLateJoinLandedSequence(__instance);
+        Plugin.Debug("Suppressed the native openingDoorsSequence for a mid-session joining client.");
+        return false;
+    }
+
+    [HarmonyPostfix]
+    [HarmonyPatch(typeof(StartOfRound), nameof(StartOfRound.OnPlayerConnectedClientRpc))]
+    private static void PlayerConnectedPostfix(StartOfRound __instance, ulong clientId)
+    {
+        if (__instance.IsServer && clientId != NetworkManager.ServerClientId && MidJoinState.IsActiveMoon)
+            NetworkSync.StartLateClientSynchronization(__instance, clientId);
+    }
 }

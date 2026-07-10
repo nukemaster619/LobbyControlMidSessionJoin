@@ -2,12 +2,19 @@ namespace LobbyControlMidSessionJoin;
 
 internal static class MidJoinState
 {
-    internal const string SnapshotMessage = "amevirus.LCMSJ.LevelSnapshot.v1";
-    internal static bool HandlerRegistered;
-    internal static bool ApplyingSnapshot;
     internal static int SnapshotsSent;
-    internal static int SnapshotsReceived;
+    internal static int LandingSequencesSuppressed;
+    internal static bool ClientLateJoinSyncActive;
+    internal static bool ClientLateJoinSyncCompleted;
+    internal static bool ClientPlayerPositioned;
     internal static string LastStatus = "No synchronization attempted yet.";
+
+    internal static void ResetClientState()
+    {
+        ClientLateJoinSyncActive = false;
+        ClientLateJoinSyncCompleted = false;
+        ClientPlayerPositioned = false;
+    }
 
     internal static bool IsActiveMoon
     {

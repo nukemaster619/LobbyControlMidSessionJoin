@@ -1,147 +1,303 @@
 using System;
+using System.Collections;
 using System.Collections.Generic;
+using System.Linq;
 using System.Reflection;
 using HarmonyLib;
-using Unity.Collections;
 using Unity.Netcode;
 using UnityEngine;
+using static Unity.Netcode.FastBufferWriter;
 
 namespace LobbyControlMidSessionJoin;
 
 internal static class NetworkSync
 {
-    private static readonly FieldInfo? RpcExecStage =
-        AccessTools.Field(typeof(NetworkBehaviour), "__rpc_exec_stage");
+    private const uint GENERATE_LEVEL_RPC_ID = 3073943002u;
+    private const uint FINISH_GENERATING_LEVEL_RPC_ID = 2729232387u;
+    private const float GENERATION_TIMEOUT_SECONDS = 60f;
+    private const float SNAPSHOT_ACK_TIMEOUT_SECONDS = 10f;
 
-    internal static void Register()
+    private static readonly MethodInfo? BeginSendClientRpc = AccessTools.Method(
+        typeof(NetworkBehaviour), "__beginSendClientRpc");
+    private static readonly MethodInfo? EndSendClientRpc = AccessTools.Method(
+        typeof(NetworkBehaviour), "__endSendClientRpc");
+    private static readonly HashSet<ulong> ActiveSynchronizations = new();
+
+    internal static void StartLateClientSynchronization(StartOfRound owner, ulong clientId)
     {
-        var manager = NetworkManager.Singleton;
-        if (manager?.CustomMessagingManager == null || MidJoinState.HandlerRegistered) return;
-
-        manager.CustomMessagingManager.RegisterNamedMessageHandler(
-            MidJoinState.SnapshotMessage, ReceiveSnapshot);
-        MidJoinState.HandlerRegistered = true;
-        Plugin.Debug("Registered level snapshot handler.");
-    }
-
-    internal static void Unregister()
-    {
-        var manager = NetworkManager.Singleton;
-        if (manager?.CustomMessagingManager != null && MidJoinState.HandlerRegistered)
-            manager.CustomMessagingManager.UnregisterNamedMessageHandler(MidJoinState.SnapshotMessage);
-        MidJoinState.HandlerRegistered = false;
-    }
-
-    internal static void SendSnapshot(ulong clientId)
-    {
-        if (!Plugin.Enabled.Value || !MidJoinState.IsActiveMoon) return;
-
-        var network = NetworkManager.Singleton;
-        var round = StartOfRound.Instance;
-        var roundManager = RoundManager.Instance;
-        if (network?.CustomMessagingManager == null || round == null || roundManager == null) return;
-
-        int moldIterations = round.currentLevel?.moldSpreadIterations ?? 0;
-        int moldStart = round.currentLevel?.moldStartPosition ?? 0;
-        int weather = round.currentLevel == null ? -1 : (int)round.currentLevel.currentWeather;
-
-        using var writer = new FastBufferWriter(64, Allocator.Temp);
-        writer.WriteValueSafe(round.randomMapSeed);
-        writer.WriteValueSafe(round.currentLevelID);
-        writer.WriteValueSafe(moldIterations);
-        writer.WriteValueSafe(moldStart);
-        writer.WriteValueSafe(weather);
-        writer.WriteValueSafe(round.shipHasLanded);
-
-        network.CustomMessagingManager.SendNamedMessage(
-            MidJoinState.SnapshotMessage, clientId, writer, NetworkDelivery.ReliableFragmentedSequenced);
-
-        MidJoinState.SnapshotsSent++;
-        MidJoinState.LastStatus = $"Sent moon snapshot to client {clientId}.";
-        Plugin.Debug(MidJoinState.LastStatus);
-    }
-
-    private static void ReceiveSnapshot(ulong senderClientId, FastBufferReader reader)
-    {
-        try
+        if (!ActiveSynchronizations.Add(clientId))
         {
-            reader.ReadValueSafe(out int seed);
-            reader.ReadValueSafe(out int levelId);
-            reader.ReadValueSafe(out int moldIterations);
-            reader.ReadValueSafe(out int moldStart);
-            reader.ReadValueSafe(out int weather);
-            reader.ReadValueSafe(out bool landed);
-
-            MidJoinState.SnapshotsReceived++;
-            ApplySnapshot(seed, levelId, moldIterations, moldStart, weather, landed);
-        }
-        catch (Exception ex)
-        {
-            MidJoinState.LastStatus = "Snapshot read failed: " + ex.Message;
-            Plugin.Log.LogError(ex);
-        }
-    }
-
-    private static void ApplySnapshot(int seed, int levelId, int moldIterations, int moldStart,
-        int weather, bool landed)
-    {
-        var round = StartOfRound.Instance;
-        var manager = RoundManager.Instance;
-        if (round == null || manager == null)
-        {
-            MidJoinState.LastStatus = "Snapshot arrived before round objects were ready.";
-            Plugin.Log.LogWarning(MidJoinState.LastStatus);
+            Plugin.Debug($"Ignored duplicate synchronization request for client {clientId}.");
             return;
         }
 
-        Plugin.Debug($"Applying seed={seed}, level={levelId}, mold={moldIterations}/{moldStart}, weather={weather}");
-        MidJoinState.ApplyingSnapshot = true;
         try
         {
-            round.inShipPhase = false;
-            round.shipHasLanded = landed;
-            round.randomMapSeed = seed;
-            round.currentLevelID = levelId;
-
-            if (levelId >= 0 && levelId < round.levels.Length)
-            {
-                round.currentLevel = round.levels[levelId];
-                round.currentLevel.moldSpreadIterations = moldIterations;
-                round.currentLevel.moldStartPosition = moldStart;
-                round.currentLevel.currentWeather = (LevelWeatherType)weather;
-            }
-
-            object? previousStage = RpcExecStage?.GetValue(manager);
-            RpcExecStage?.SetValue(manager, 1); // NetworkBehaviour.__RpcExecStage.Execute
-            manager.GenerateNewLevelClientRpc(seed, levelId, moldIterations, moldStart, null);
-            if (previousStage != null) RpcExecStage?.SetValue(manager, previousStage);
-
-            if (Plugin.SpawnInShip.Value)
-                MoveLocalPlayerIntoShip(round);
-
-            MidJoinState.LastStatus = $"Applied moon snapshot (level {levelId}, seed {seed}).";
-            Plugin.Debug(MidJoinState.LastStatus);
+            owner.StartCoroutine(SynchronizeLateClientGuarded(clientId));
         }
-        catch (Exception ex)
+        catch
         {
-            MidJoinState.LastStatus = "Snapshot application failed: " + ex.Message;
-            Plugin.Log.LogError(ex);
-        }
-        finally
-        {
-            MidJoinState.ApplyingSnapshot = false;
+            ActiveSynchronizations.Remove(clientId);
+            throw;
         }
     }
 
-    private static void MoveLocalPlayerIntoShip(StartOfRound round)
+    internal static void ResetSynchronizations()
     {
-        var player = round.localPlayerController;
-        if (player == null || round.elevatorTransform == null) return;
+        ActiveSynchronizations.Clear();
+    }
 
-        Vector3 position = round.elevatorTransform.position + Vector3.up * 0.5f;
-        player.TeleportPlayer(position);
-        player.isInElevator = true;
-        player.isInHangarShipRoom = true;
-        player.isInsideFactory = false;
+    private static IEnumerator SynchronizeLateClientGuarded(ulong clientId)
+    {
+        try
+        {
+            yield return SynchronizeLateClientCore(clientId);
+        }
+        finally
+        {
+            ActiveSynchronizations.Remove(clientId);
+            WorldStateSync.ClearSnapshotAcknowledgement(clientId);
+        }
+    }
+
+    private static IEnumerator SynchronizeLateClientCore(ulong clientId)
+    {
+        if (!Plugin.Enabled.Value || !MidJoinState.IsActiveMoon)
+            yield break;
+
+        var network = NetworkManager.Singleton;
+        var manager = RoundManager.Instance;
+        if (network == null || manager == null || !network.IsServer)
+            yield break;
+
+        // Let OnPlayerConnectedClientRpc finish assigning the late player's objects and let
+        // NGO complete the first spawned-object synchronization pass before level generation.
+        yield return null;
+        yield return null;
+
+        if (!IsClientConnected(network, clientId))
+        {
+            SetStatus($"Client {clientId} disconnected before synchronization.");
+            yield break;
+        }
+
+        if (!MidJoinState.IsActiveMoon)
+        {
+            SetStatus("Round left the landed state before synchronization.");
+            yield break;
+        }
+
+        try
+        {
+            WorldStateSync.ResetSnapshotAcknowledgement(clientId);
+            WorldStateSync.SendSnapshot(clientId, includeInterior: false);
+            SetStatus($"Waiting for client {clientId} to acknowledge the landed ship snapshot.");
+        }
+        catch (Exception ex)
+        {
+            SetStatus("Landed ship snapshot synchronization failed: " + ex.Message);
+            Plugin.Log.LogError(ex);
+            yield break;
+        }
+
+        float acknowledgementDeadline =
+            Time.realtimeSinceStartup + SNAPSHOT_ACK_TIMEOUT_SECONDS;
+        float nextSnapshotResend = Time.realtimeSinceStartup + 0.5f;
+        while (!WorldStateSync.HasSnapshotAcknowledgement(clientId))
+        {
+            if (!IsClientConnected(network, clientId))
+            {
+                WorldStateSync.ClearSnapshotAcknowledgement(clientId);
+                SetStatus($"Client {clientId} disconnected before acknowledging the landed ship state.");
+                yield break;
+            }
+
+            if (!MidJoinState.IsActiveMoon)
+            {
+                WorldStateSync.ClearSnapshotAcknowledgement(clientId);
+                SetStatus("Round left the landed state before the late client acknowledged ship state.");
+                yield break;
+            }
+
+            if (Time.realtimeSinceStartup >= acknowledgementDeadline)
+            {
+                WorldStateSync.ClearSnapshotAcknowledgement(clientId);
+                SetStatus($"Timed out waiting for client {clientId} to acknowledge the landed ship state.");
+                yield break;
+            }
+
+            if (Time.realtimeSinceStartup >= nextSnapshotResend)
+            {
+                try
+                {
+                    WorldStateSync.SendSnapshot(clientId, includeInterior: false);
+                }
+                catch (Exception ex)
+                {
+                    Plugin.Debug("Could not resend landed ship snapshot: " + ex.Message);
+                }
+                nextSnapshotResend = Time.realtimeSinceStartup + 0.5f;
+            }
+
+            yield return null;
+        }
+
+        WorldStateSync.ClearSnapshotAcknowledgement(clientId);
+        try
+        {
+            manager.playersFinishedGeneratingFloor.Remove(clientId);
+            SendGenerateLevelRpc(manager, clientId);
+            SetStatus($"Waiting for client {clientId} to finish generating the interior.");
+        }
+        catch (Exception ex)
+        {
+            SetStatus("Native moon generation synchronization failed: " + ex.Message);
+            Plugin.Log.LogError(ex);
+            yield break;
+        }
+
+        if (StartOfRound.Instance.currentLevel.spawnEnemiesAndScrap)
+        {
+            float deadline = Time.realtimeSinceStartup + GENERATION_TIMEOUT_SECONDS;
+            while (!manager.playersFinishedGeneratingFloor.Contains(clientId))
+            {
+                if (!IsClientConnected(network, clientId))
+                {
+                    SetStatus($"Client {clientId} disconnected while generating the interior.");
+                    yield break;
+                }
+
+                if (!MidJoinState.IsActiveMoon)
+                {
+                    SetStatus("Round left the landed state while the late client was generating.");
+                    yield break;
+                }
+
+                if (Time.realtimeSinceStartup >= deadline)
+                {
+                    SetStatus($"Timed out waiting for client {clientId} to finish generating the interior.");
+                    yield break;
+                }
+
+                yield return null;
+            }
+        }
+
+        try
+        {
+            // FinishGeneratingNewLevelClientRpc performs client-local post-processing, including
+            // RefreshLightsList. It must not run until this specific client's dungeon exists.
+            SendEmptyClientRpc(manager, FINISH_GENERATING_LEVEL_RPC_ID, clientId);
+            manager.playersFinishedGeneratingFloor.Remove(clientId);
+        }
+        catch (Exception ex)
+        {
+            SetStatus("Late-client finalization failed: " + ex.Message);
+            Plugin.Log.LogError(ex);
+            yield break;
+        }
+
+        // Give the joining client time to execute the native finish RPC before the separate
+        // targeted custom-message channel applies lights, doors, and other local scene state.
+        yield return new WaitForSeconds(0.25f);
+
+        try
+        {
+            WorldStateSync.SendSnapshot(clientId, includeInterior: true);
+            MidJoinState.SnapshotsSent++;
+            SetStatus($"Completed ship, interior, door, and lighting synchronization for client {clientId}.");
+        }
+        catch (Exception ex)
+        {
+            SetStatus("Late-client world-state synchronization failed: " + ex.Message);
+            Plugin.Log.LogError(ex);
+        }
+    }
+
+    private static bool IsClientConnected(NetworkManager network, ulong clientId)
+    {
+        return network.ConnectedClients.ContainsKey(clientId);
+    }
+
+    private static void SendGenerateLevelRpc(RoundManager manager, ulong clientId)
+    {
+        var round = StartOfRound.Instance;
+        if (round == null || round.currentLevel == null)
+            throw new InvalidOperationException("Round state is not ready.");
+
+        var rpcParams = TargetClient(clientId);
+        var writer = BeginRpc(manager, GENERATE_LEVEL_RPC_ID, rpcParams);
+
+        BytePacker.WriteValueBitPacked(writer, round.randomMapSeed);
+        BytePacker.WriteValueBitPacked(writer, round.currentLevelID);
+        BytePacker.WriteValueBitPacked(writer, round.currentLevel.moldSpreadIterations);
+        BytePacker.WriteValueBitPacked(writer, round.currentLevel.moldStartPosition);
+
+        var moldManager = UnityEngine.Object.FindObjectOfType<MoldSpreadManager>();
+        bool hasMoldState = moldManager != null && round.currentLevelID >= 0;
+        writer.WriteValueSafe(hasMoldState);
+        if (hasMoldState)
+        {
+            int[] destroyedMold = moldManager!.planetMoldStates[round.currentLevelID]
+                .destroyedMold.ToArray();
+            writer.WriteValueSafe(destroyedMold, default(ForPrimitives));
+        }
+
+        BytePacker.WriteValueBitPacked(writer, (int)round.currentLevel.currentWeather + 255);
+        EndRpc(manager, writer, GENERATE_LEVEL_RPC_ID, rpcParams);
+
+        Plugin.Debug(
+            $"Started native level sync client={clientId}, seed={round.randomMapSeed}, " +
+            $"level={round.currentLevelID}, mold={round.currentLevel.moldSpreadIterations}/" +
+            $"{round.currentLevel.moldStartPosition}, weather={(int)round.currentLevel.currentWeather}, " +
+            $"moldState={hasMoldState}");
+    }
+
+    private static void SendEmptyClientRpc(NetworkBehaviour target, uint rpcId, ulong clientId)
+    {
+        var rpcParams = TargetClient(clientId);
+        var writer = BeginRpc(target, rpcId, rpcParams);
+        EndRpc(target, writer, rpcId, rpcParams);
+    }
+
+    private static FastBufferWriter BeginRpc(
+        NetworkBehaviour target,
+        uint rpcId,
+        ClientRpcParams rpcParams)
+    {
+        if (BeginSendClientRpc == null || EndSendClientRpc == null)
+            throw new MissingMethodException("Unity Netcode ClientRpc send methods were not found.");
+
+        return (FastBufferWriter)BeginSendClientRpc.Invoke(
+            target,
+            new object[] { rpcId, rpcParams, RpcDelivery.Reliable })!;
+    }
+
+    private static void EndRpc(
+        NetworkBehaviour target,
+        FastBufferWriter writer,
+        uint rpcId,
+        ClientRpcParams rpcParams)
+    {
+        EndSendClientRpc!.Invoke(
+            target,
+            new object[] { writer, rpcId, rpcParams, RpcDelivery.Reliable });
+    }
+
+    private static ClientRpcParams TargetClient(ulong clientId)
+    {
+        return new ClientRpcParams
+        {
+            Send = new ClientRpcSendParams
+            {
+                TargetClientIds = new List<ulong> { clientId }
+            }
+        };
+    }
+
+    private static void SetStatus(string status)
+    {
+        MidJoinState.LastStatus = status;
+        Plugin.Debug(status);
     }
 }

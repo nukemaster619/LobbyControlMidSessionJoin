@@ -1,10 +1,10 @@
 {
   "name": "LobbyControlMidSessionJoin",
-  "version_number": "0.1.0",
-  "website_url": "",
-  "description": "Experimental mid-session moon joining compatibility add-on for LobbyControl.",
+  "version_number": "0.3.3",
+  "website_url": "https://github.com/nukemaster619/LobbyControlMidSessionJoin",
+  "description": "Allows LobbyControl players to join after landing and synchronizes the ship, interior lighting, facility power, and door states.",
   "dependencies": [
-    "BepInEx-BepInExPack-5.4.2100",
-    "mattymatty-LobbyControl-2.5.12"
+    "BepInEx-BepInExPack-5.4.2305",
+    "mattymatty-LobbyControl-2.5.11"
   ]
 }

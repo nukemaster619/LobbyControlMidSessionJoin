@@ -75,8 +75,7 @@ internal static class TerminalCommands
                $"Enabled: {Plugin.Enabled.Value}\n" +
                $"Phase: {phase}\n" +
                $"LobbyControl bridge: {(LobbyControlBridge.Available ? "OK" : "NOT FOUND")}\n" +
-               $"Message handler: {MidJoinState.HandlerRegistered}\n" +
-               $"Snapshots sent/received: {MidJoinState.SnapshotsSent}/{MidJoinState.SnapshotsReceived}\n" +
+               $"Native syncs sent: {MidJoinState.SnapshotsSent}\n" +
                $"Auto-open lobby: {Plugin.AutoOpenLobby.Value}\n" +
                $"Spawn in ship: {Plugin.SpawnInShip.Value}\n" +
                $"Debug: {Plugin.DebugLogging.Value}\n" +
