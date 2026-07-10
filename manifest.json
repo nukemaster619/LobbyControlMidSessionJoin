@@ -1,0 +1,10 @@
+{
+  "name": "LobbyControlMidSessionJoin",
+  "version_number": "0.1.0",
+  "website_url": "",
+  "description": "Experimental mid-session moon joining compatibility add-on for LobbyControl.",
+  "dependencies": [
+    "BepInEx-BepInExPack-5.4.2100",
+    "mattymatty-LobbyControl-2.5.12"
+  ]
+}
