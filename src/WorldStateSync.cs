@@ -32,6 +32,10 @@ internal static class WorldStateSync
         FindInstanceField(typeof(HUDManager), "LoadingScreen");
     private static readonly FieldInfo? LegacyLoadingDarkenScreenField =
         FindInstanceField(typeof(HUDManager), "loadingDarkenScreen");
+    private static readonly FieldInfo? RoundPowerLightsCoroutineField =
+        FindInstanceField(typeof(RoundManager), "powerLightsCoroutine");
+    private static readonly FieldInfo? RoundFlickerLightsCoroutineField =
+        FindInstanceField(typeof(RoundManager), "flickerLightsCoroutine");
 
     private static readonly FieldInfo? PlayerFallValueField =
         FindInstanceField(typeof(PlayerControllerB), "fallValue");
@@ -94,6 +98,7 @@ internal static class WorldStateSync
         network.CustomMessagingManager.RegisterNamedMessageHandler(
             ACK_MESSAGE_NAME,
             ReceiveSnapshotAcknowledgement);
+        network.OnClientDisconnectCallback += HandleClientDisconnected;
         _registeredNetwork = network;
         Plugin.Debug("Registered targeted world-state synchronization handler.");
     }
@@ -109,7 +114,11 @@ internal static class WorldStateSync
             network.StopCoroutine(_applySnapshotCoroutine);
             _applySnapshotCoroutine = null;
         }
-        if (network == null || network.CustomMessagingManager == null)
+        if (network == null)
+            return;
+
+        network.OnClientDisconnectCallback -= HandleClientDisconnected;
+        if (network.CustomMessagingManager == null)
             return;
 
         try
@@ -121,6 +130,19 @@ internal static class WorldStateSync
         {
             Plugin.Debug("Could not unregister world-state handler: " + ex.Message);
         }
+    }
+
+    private static void HandleClientDisconnected(ulong clientId)
+    {
+        NetworkSync.HandleClientDisconnected(clientId);
+        ShipSnapshotAcknowledgements.Remove(clientId);
+
+        var network = _registeredNetwork;
+        if (network == null || clientId != network.LocalClientId)
+            return;
+
+        UnregisterHandler();
+        MidJoinState.ResetClientState();
     }
 
     internal static void ResetSnapshotAcknowledgement(ulong clientId)
@@ -164,7 +186,8 @@ internal static class WorldStateSync
         Plugin.Debug(
             $"Sent {(includeInterior ? "complete" : "ship-only")} world snapshot to client {clientId}: " +
             $"doors={snapshot.Doors.Count}, terminalDoors={snapshot.TerminalDoors.Count}, " +
-            $"power={snapshot.PowerOn}, landed={snapshot.ShipHasLanded}");
+            $"power={snapshot.PowerOn}, permanentPowerLoss={snapshot.PowerOffPermanently}, " +
+            $"landed={snapshot.ShipHasLanded}");
     }
 
     private static WorldSnapshot CaptureSnapshot(bool includeInterior)
@@ -172,6 +195,17 @@ internal static class WorldStateSync
         var round = StartOfRound.Instance ?? throw new InvalidOperationException("StartOfRound is not ready.");
         var manager = RoundManager.Instance;
         var breaker = UnityEngine.Object.FindObjectOfType<BreakerBox>();
+        bool apparatusRemoved = false;
+        foreach (LungProp apparatus in UnityEngine.Object.FindObjectsOfType<LungProp>())
+        {
+            if (!apparatus.isLungDocked)
+            {
+                apparatusRemoved = true;
+                break;
+            }
+        }
+        bool powerOffPermanently = manager != null &&
+                                   (manager.powerOffPermanently || apparatusRemoved);
 
         var snapshot = new WorldSnapshot
         {
@@ -186,8 +220,8 @@ internal static class WorldStateSync
             TravellingToNewLevel = round.travellingToNewLevel,
             ShipAmbiancePlaying = round.shipAmbianceAudio != null && round.shipAmbianceAudio.isPlaying,
             ShipTravelAudioPlaying = round.ship3DAudio != null && round.ship3DAudio.isPlaying,
-            PowerOffPermanently = manager != null && manager.powerOffPermanently,
-            PowerOn = manager != null && !manager.powerOffPermanently &&
+            PowerOffPermanently = powerOffPermanently,
+            PowerOn = manager != null && !powerOffPermanently &&
                       (breaker == null || breaker.isPowerOn),
             ShipTransform = CaptureTransform(round.shipAnimatorObject != null
                 ? round.shipAnimatorObject.transform
@@ -429,6 +463,7 @@ internal static class WorldStateSync
         if (snapshot.IncludeInterior)
         {
             ApplyInteriorState(snapshot);
+            yield return StabilizePowerState(snapshot);
             MidJoinState.ClientLateJoinSyncCompleted = true;
             MidJoinState.ClientLateJoinSyncActive = false;
             ApplyShipState(snapshot, moveLocalPlayer: false, holdAnimations: false);
@@ -629,14 +664,60 @@ internal static class WorldStateSync
             $"terminalDoors={matchedTerminalDoors}/{snapshot.TerminalDoors.Count}, power={snapshot.PowerOn}");
     }
 
+    private static IEnumerator StabilizePowerState(WorldSnapshot snapshot)
+    {
+        float deadline = Time.realtimeSinceStartup +
+                         (snapshot.PowerOffPermanently ? 3f : 0.75f);
+        while (Time.realtimeSinceStartup < deadline)
+        {
+            var manager = RoundManager.Instance;
+            if (manager == null || NetworkManager.Singleton == null ||
+                !NetworkManager.Singleton.IsClient)
+                yield break;
+
+            ApplyPowerState(manager, snapshot.PowerOn, snapshot.PowerOffPermanently);
+            yield return new WaitForSecondsRealtime(0.1f);
+        }
+    }
+
+    internal static bool ShouldBlockFacilityPowerOn(RoundManager manager, bool powerOn)
+    {
+        if (!powerOn || manager == null || !manager.powerOffPermanently)
+            return false;
+
+        var network = NetworkManager.Singleton;
+        return network != null && network.IsClient && !network.IsServer;
+    }
+
     private static void ApplyPowerState(RoundManager manager, bool powerOn, bool permanentlyOff)
     {
+        if (permanentlyOff)
+            powerOn = false;
+
+        StopRoundCoroutine(manager, RoundFlickerLightsCoroutineField);
+        StopRoundCoroutine(manager, RoundPowerLightsCoroutineField);
         manager.powerOffPermanently = permanentlyOff;
+
         var breaker = UnityEngine.Object.FindObjectOfType<BreakerBox>();
         if (breaker != null)
             breaker.isPowerOn = powerOn;
+
+        foreach (LungProp apparatus in UnityEngine.Object.FindObjectsOfType<LungProp>())
+        {
+            if (permanentlyOff)
+                apparatus.isLungDocked = false;
+        }
+
         manager.onPowerSwitch.Invoke(powerOn);
         manager.TurnOnAllLights(powerOn);
+    }
+
+    private static void StopRoundCoroutine(RoundManager manager, FieldInfo? field)
+    {
+        if (field?.GetValue(manager) is not Coroutine coroutine)
+            return;
+        manager.StopCoroutine(coroutine);
+        field.SetValue(manager, null);
     }
 
     private static void ApplyDoor(DoorLock door, DoorSnapshot snapshot)

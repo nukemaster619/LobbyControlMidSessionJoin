@@ -98,4 +98,16 @@ internal static class Patches
         if (__instance.IsServer && clientId != NetworkManager.ServerClientId && MidJoinState.IsActiveMoon)
             NetworkSync.StartLateClientSynchronization(__instance, clientId);
     }
+    [HarmonyPrefix]
+    [HarmonyPriority(Priority.First)]
+    [HarmonyPatch(typeof(RoundManager), nameof(RoundManager.TurnOnAllLights))]
+    private static bool TurnOnAllLightsPrefix(RoundManager __instance, bool on)
+    {
+        if (!WorldStateSync.ShouldBlockFacilityPowerOn(__instance, on))
+            return true;
+
+        Plugin.Debug("Blocked a delayed client-local facility lights-on call after permanent apparatus power loss.");
+        return false;
+    }
+
 }

@@ -4,5 +4,3 @@ obj/
 .idea/
 lib/*.dll
 !lib/.gitkeep
-
-dist/

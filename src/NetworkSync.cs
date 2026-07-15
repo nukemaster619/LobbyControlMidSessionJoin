@@ -21,23 +21,27 @@ internal static class NetworkSync
         typeof(NetworkBehaviour), "__beginSendClientRpc");
     private static readonly MethodInfo? EndSendClientRpc = AccessTools.Method(
         typeof(NetworkBehaviour), "__endSendClientRpc");
-    private static readonly HashSet<ulong> ActiveSynchronizations = new();
+    private static readonly Dictionary<ulong, int> ActiveSynchronizations = new();
+    private static int _nextSynchronizationId;
 
     internal static void StartLateClientSynchronization(StartOfRound owner, ulong clientId)
     {
-        if (!ActiveSynchronizations.Add(clientId))
+        if (ActiveSynchronizations.ContainsKey(clientId))
         {
             Plugin.Debug($"Ignored duplicate synchronization request for client {clientId}.");
             return;
         }
 
+        int synchronizationId = ++_nextSynchronizationId;
+        ActiveSynchronizations[clientId] = synchronizationId;
         try
         {
-            owner.StartCoroutine(SynchronizeLateClientGuarded(clientId));
+            owner.StartCoroutine(SynchronizeLateClientGuarded(clientId, synchronizationId));
         }
         catch
         {
-            ActiveSynchronizations.Remove(clientId);
+            if (IsCurrentSynchronization(clientId, synchronizationId))
+                ActiveSynchronizations.Remove(clientId);
             throw;
         }
     }
@@ -45,22 +49,41 @@ internal static class NetworkSync
     internal static void ResetSynchronizations()
     {
         ActiveSynchronizations.Clear();
+        _nextSynchronizationId = 0;
     }
 
-    private static IEnumerator SynchronizeLateClientGuarded(ulong clientId)
+    internal static void HandleClientDisconnected(ulong clientId)
+    {
+        ActiveSynchronizations.Remove(clientId);
+        WorldStateSync.ClearSnapshotAcknowledgement(clientId);
+        RoundManager.Instance?.playersFinishedGeneratingFloor.Remove(clientId);
+        Plugin.Debug($"Cleared late-join synchronization state for disconnected client {clientId}.");
+    }
+
+    private static bool IsCurrentSynchronization(ulong clientId, int synchronizationId)
+    {
+        return ActiveSynchronizations.TryGetValue(clientId, out int currentId) &&
+               currentId == synchronizationId;
+    }
+
+    private static IEnumerator SynchronizeLateClientGuarded(ulong clientId, int synchronizationId)
     {
         try
         {
-            yield return SynchronizeLateClientCore(clientId);
+            yield return SynchronizeLateClientCore(clientId, synchronizationId);
         }
         finally
         {
-            ActiveSynchronizations.Remove(clientId);
-            WorldStateSync.ClearSnapshotAcknowledgement(clientId);
+            if (IsCurrentSynchronization(clientId, synchronizationId))
+            {
+                ActiveSynchronizations.Remove(clientId);
+                WorldStateSync.ClearSnapshotAcknowledgement(clientId);
+                RoundManager.Instance?.playersFinishedGeneratingFloor.Remove(clientId);
+            }
         }
     }
 
-    private static IEnumerator SynchronizeLateClientCore(ulong clientId)
+    private static IEnumerator SynchronizeLateClientCore(ulong clientId, int synchronizationId)
     {
         if (!Plugin.Enabled.Value || !MidJoinState.IsActiveMoon)
             yield break;
@@ -74,6 +97,9 @@ internal static class NetworkSync
         // NGO complete the first spawned-object synchronization pass before level generation.
         yield return null;
         yield return null;
+
+        if (!IsCurrentSynchronization(clientId, synchronizationId))
+            yield break;
 
         if (!IsClientConnected(network, clientId))
         {
@@ -105,6 +131,8 @@ internal static class NetworkSync
         float nextSnapshotResend = Time.realtimeSinceStartup + 0.5f;
         while (!WorldStateSync.HasSnapshotAcknowledgement(clientId))
         {
+            if (!IsCurrentSynchronization(clientId, synchronizationId))
+                yield break;
             if (!IsClientConnected(network, clientId))
             {
                 WorldStateSync.ClearSnapshotAcknowledgement(clientId);
@@ -161,6 +189,8 @@ internal static class NetworkSync
             float deadline = Time.realtimeSinceStartup + GENERATION_TIMEOUT_SECONDS;
             while (!manager.playersFinishedGeneratingFloor.Contains(clientId))
             {
+                if (!IsCurrentSynchronization(clientId, synchronizationId))
+                    yield break;
                 if (!IsClientConnected(network, clientId))
                 {
                     SetStatus($"Client {clientId} disconnected while generating the interior.");
@@ -183,6 +213,10 @@ internal static class NetworkSync
             }
         }
 
+        if (!IsCurrentSynchronization(clientId, synchronizationId) ||
+            !IsClientConnected(network, clientId))
+            yield break;
+
         try
         {
             // FinishGeneratingNewLevelClientRpc performs client-local post-processing, including
@@ -200,6 +234,10 @@ internal static class NetworkSync
         // Give the joining client time to execute the native finish RPC before the separate
         // targeted custom-message channel applies lights, doors, and other local scene state.
         yield return new WaitForSeconds(0.25f);
+
+        if (!IsCurrentSynchronization(clientId, synchronizationId) ||
+            !IsClientConnected(network, clientId))
+            yield break;
 
         try
         {

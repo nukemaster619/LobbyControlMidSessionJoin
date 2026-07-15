@@ -5,7 +5,7 @@
     <Nullable>enable</Nullable>
     <AssemblyName>LobbyControlMidSessionJoin</AssemblyName>
     <RootNamespace>LobbyControlMidSessionJoin</RootNamespace>
-    <Version>0.3.3</Version>
+    <Version>0.3.5</Version>
   </PropertyGroup>
   <ItemGroup>
     <PackageReference Include="BepInEx.Core" Version="5.4.21" Private="false" />
