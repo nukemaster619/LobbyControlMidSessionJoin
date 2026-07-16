@@ -6,7 +6,6 @@ Compatibility add-on for **LobbyControl**. It allows players to connect after th
 
 - Install this on **every player**, not only the host.
 - Install LobbyControl as usual.
-<<<<<<< HEAD
 
 ## Terminal commands (host)
 
@@ -18,10 +17,6 @@ midjoin debug on|off
 midjoin autoopen on|off
 midjoin spawninship on|off
 ```
-=======
-- Do **not** install VeryLateCompany at the same time; both mods patch the same connection and level-generation paths.
-- This is source-first experimental code. Mid-round synchronization is one of Lethal Company's most version-sensitive systems, so test with a disposable save and two clients.
->>>>>>> c707aca (Release v0.4.0)
 
 ## Known limitations
 
