@@ -30,10 +30,3 @@
 
 - Improved apparatus and facility power synchronization for late joiners.
 - Fixed stale synchronization state causing timeouts or errors when a late joiner left and rejoined the same lobby.
-
-## [0.3.3]
-
-### Fixed
-
-- Fixed late joiners sliding, floating, or keeping stale movement state after joining on a landed moon.
-- Improved snapshot application, acknowledgment handling, and landed ship-state restoration.
