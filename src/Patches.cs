@@ -92,12 +92,28 @@ internal static class Patches
     }
 
     [HarmonyPostfix]
+    [HarmonyPatch(typeof(StartOfRound), "SetShipReadyToLand")]
+    private static void SetShipReadyToLandPostfix(StartOfRound __instance)
+    {
+        WorldStateSync.RestoreLevelInformationOverlayForOrbit(__instance);
+    }
+
+    [HarmonyPostfix]
     [HarmonyPatch(typeof(StartOfRound), nameof(StartOfRound.OnPlayerConnectedClientRpc))]
     private static void PlayerConnectedPostfix(StartOfRound __instance, ulong clientId)
     {
         if (__instance.IsServer && clientId != NetworkManager.ServerClientId && MidJoinState.IsActiveMoon)
             NetworkSync.StartLateClientSynchronization(__instance, clientId);
     }
+    [HarmonyPrefix]
+    [HarmonyPriority(Priority.First)]
+    [HarmonyPatch(typeof(TerminalAccessibleObject), nameof(TerminalAccessibleObject.InitializeValues))]
+    private static bool TerminalAccessibleObjectInitializeValuesPrefix(
+        TerminalAccessibleObject __instance)
+    {
+        return !WorldStateSync.ShouldDeferTerminalInitialization(__instance);
+    }
+
     [HarmonyPrefix]
     [HarmonyPriority(Priority.First)]
     [HarmonyPatch(typeof(RoundManager), nameof(RoundManager.TurnOnAllLights))]

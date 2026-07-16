@@ -28,6 +28,12 @@ internal static class WorldStateSync
         FindInstanceField(typeof(TerminalAccessibleObject), "isDoorOpen");
     private static readonly FieldInfo? TerminalPoweredField =
         FindInstanceField(typeof(TerminalAccessibleObject), "isPoweredOn");
+    private static readonly FieldInfo? TerminalInitializedValuesField =
+        FindInstanceField(typeof(TerminalAccessibleObject), "initializedValues");
+    private static readonly FieldInfo? TerminalMapRadarTextField =
+        FindInstanceField(typeof(TerminalAccessibleObject), "mapRadarText");
+    private static readonly FieldInfo? TerminalMapRadarBoxField =
+        FindInstanceField(typeof(TerminalAccessibleObject), "mapRadarBox");
     private static readonly FieldInfo? LoadingScreenAnimatorField =
         FindInstanceField(typeof(HUDManager), "LoadingScreen");
     private static readonly FieldInfo? LegacyLoadingDarkenScreenField =
@@ -36,6 +42,16 @@ internal static class WorldStateSync
         FindInstanceField(typeof(RoundManager), "powerLightsCoroutine");
     private static readonly FieldInfo? RoundFlickerLightsCoroutineField =
         FindInstanceField(typeof(RoundManager), "flickerLightsCoroutine");
+    private static readonly FieldInfo? MapScreenIsScreenOnField =
+        FindInstanceField(typeof(ManualCameraRenderer), "isScreenOn");
+    private static readonly FieldInfo? MapScreenEnabledOnLocalClientField =
+        FindInstanceField(typeof(ManualCameraRenderer), "screenEnabledOnLocalClient");
+    private static readonly FieldInfo? MapScreenUpdateCoroutineField =
+        FindInstanceField(typeof(ManualCameraRenderer), "updateMapCameraCoroutine");
+    private static readonly FieldInfo? MapScreenSyncingTargetField =
+        FindInstanceField(typeof(ManualCameraRenderer), "syncingTargetPlayer");
+    private static readonly FieldInfo? MapScreenSyncingSwitchField =
+        FindInstanceField(typeof(ManualCameraRenderer), "syncingSwitchScreen");
 
     private static readonly FieldInfo? PlayerFallValueField =
         FindInstanceField(typeof(PlayerControllerB), "fallValue");
@@ -81,6 +97,7 @@ internal static class WorldStateSync
         FindInstanceField(typeof(PlayerControllerB), "updatePositionForNewlyJoinedClient");
 
     private static readonly HashSet<ulong> ShipSnapshotAcknowledgements = new();
+    private static readonly HashSet<int> DeferredTerminalInitializations = new();
     private static NetworkManager? _registeredNetwork;
     private static WorldSnapshot? _latestClientSnapshot;
     private static Coroutine? _applySnapshotCoroutine;
@@ -109,6 +126,7 @@ internal static class WorldStateSync
         _registeredNetwork = null;
         _latestClientSnapshot = null;
         ShipSnapshotAcknowledgements.Clear();
+        DeferredTerminalInitializations.Clear();
         if (network != null && _applySnapshotCoroutine != null)
         {
             network.StopCoroutine(_applySnapshotCoroutine);
@@ -550,6 +568,7 @@ internal static class WorldStateSync
                 holdAnimations: true);
         }
         ApplyImmediateLandedState(round, resetPlayerMotion: true);
+        RestoreShipRadarMonitor(round);
 
         while (MidJoinState.ClientLateJoinSyncActive &&
                Time.realtimeSinceStartup < deadline &&
@@ -562,6 +581,179 @@ internal static class WorldStateSync
         if (finalSnapshot != null)
             ApplyShipState(finalSnapshot, moveLocalPlayer: false, holdAnimations: false);
         ApplyImmediateLandedState(round, resetPlayerMotion: true);
+        yield return null;
+        RestoreShipRadarMonitor(round);
+    }
+
+    private static void RestoreShipRadarMonitor(StartOfRound round)
+    {
+        try
+        {
+            ManualCameraRenderer? mapScreen = round.mapScreen;
+            DisableLevelInformationOverlay(round, mapScreen);
+
+            if (mapScreen == null || mapScreen.mapCamera == null)
+                return;
+
+            Coroutine? previousTargetUpdate = ReadField<Coroutine?>(
+                MapScreenUpdateCoroutineField,
+                mapScreen,
+                null);
+            if (previousTargetUpdate != null)
+                mapScreen.StopCoroutine(previousTargetUpdate);
+
+            mapScreen.overrideCameraForOtherUse = false;
+            mapScreen.currentCameraDisabled = false;
+            mapScreen.cam = mapScreen.mapCamera;
+            SetField(MapScreenIsScreenOnField, mapScreen, true);
+            SetField(MapScreenEnabledOnLocalClientField, mapScreen, true);
+            SetField(MapScreenUpdateCoroutineField, mapScreen, null);
+            SetField(MapScreenSyncingTargetField, mapScreen, false);
+            SetField(MapScreenSyncingSwitchField, mapScreen, false);
+
+            mapScreen.SwitchScreenOn(true);
+
+            if (mapScreen.radarTargets == null || mapScreen.radarTargets.Count == 0)
+            {
+                RebuildRadarTargets(round, mapScreen);
+            }
+
+            if (mapScreen.radarTargets != null && mapScreen.radarTargets.Count > 0)
+            {
+                int targetIndex = FindUsableRadarTarget(mapScreen);
+                mapScreen.targetTransformIndex = targetIndex;
+                TransformAndName target = mapScreen.radarTargets[targetIndex];
+                mapScreen.targetedPlayer = target.transform != null
+                    ? target.transform.GetComponent<PlayerControllerB>()
+                    : null;
+                if (round.mapScreenPlayerName != null)
+                    round.mapScreenPlayerName.text = "MONITORING: " + target.name;
+                mapScreen.SwitchRadarTargetAndSync(targetIndex);
+            }
+
+            mapScreen.mapCamera.enabled = true;
+            Plugin.Debug(
+                $"Restored landed radar renderer: targets={mapScreen.radarTargets?.Count ?? 0}, " +
+                $"target={mapScreen.targetTransformIndex}, camera={mapScreen.cam.name}.");
+        }
+        catch (Exception ex)
+        {
+            Plugin.Debug("Could not restore the landed ship radar monitor: " + ex);
+        }
+    }
+
+
+    private static void DisableLevelInformationOverlay(
+        StartOfRound round,
+        ManualCameraRenderer? mapScreen)
+    {
+        if (round.screenLevelDescription != null)
+        {
+            round.screenLevelDescription.enabled = false;
+            round.screenLevelDescription.gameObject.SetActive(false);
+        }
+
+        if (round.screenLevelVideoReel != null)
+        {
+            var videoPlayer = round.screenLevelVideoReel;
+            videoPlayer.Stop();
+            videoPlayer.enabled = false;
+
+            // The level reel's visible quad is not reliably exposed through
+            // targetMaterialRenderer. Disable the complete reel object so its last decoded
+            // frame cannot remain composited above the radar after the VideoPlayer stops.
+            if (videoPlayer.gameObject != null &&
+                (mapScreen == null || videoPlayer.gameObject != mapScreen.gameObject))
+            {
+                videoPlayer.gameObject.SetActive(false);
+            }
+            else
+            {
+                DisableVideoOverlayRenderers(videoPlayer, mapScreen);
+            }
+        }
+
+        if (round.radarCanvas != null)
+        {
+            round.radarCanvas.gameObject.SetActive(true);
+            round.radarCanvas.enabled = true;
+        }
+
+        if (round.mapScreenPlayerName != null)
+        {
+            round.mapScreenPlayerName.gameObject.SetActive(true);
+            round.mapScreenPlayerName.enabled = true;
+        }
+
+        if (mapScreen != null && mapScreen.mapCameraStationaryUI != null)
+            mapScreen.mapCameraStationaryUI.gameObject.SetActive(true);
+    }
+
+    internal static void RestoreLevelInformationOverlayForOrbit(StartOfRound round)
+    {
+        if (round == null || !round.inShipPhase)
+            return;
+
+        if (round.screenLevelDescription != null)
+            round.screenLevelDescription.gameObject.SetActive(true);
+
+        if (round.screenLevelVideoReel != null)
+        {
+            var videoPlayer = round.screenLevelVideoReel;
+            if (videoPlayer.gameObject != null)
+                videoPlayer.gameObject.SetActive(true);
+
+            foreach (Renderer renderer in videoPlayer.GetComponentsInChildren<Renderer>(true))
+                renderer.enabled = true;
+
+            Renderer? targetRenderer = videoPlayer.targetMaterialRenderer;
+            if (targetRenderer != null)
+                targetRenderer.enabled = true;
+
+            videoPlayer.enabled = true;
+        }
+    }
+
+    private static void DisableVideoOverlayRenderers(
+        UnityEngine.Video.VideoPlayer videoPlayer,
+        ManualCameraRenderer? mapScreen)
+    {
+        Renderer? protectedRadarRenderer = mapScreen?.mesh;
+        Renderer? targetRenderer = videoPlayer.targetMaterialRenderer;
+        if (targetRenderer != null && targetRenderer != protectedRadarRenderer)
+            targetRenderer.enabled = false;
+
+        foreach (Renderer renderer in videoPlayer.GetComponentsInChildren<Renderer>(true))
+        {
+            if (renderer != protectedRadarRenderer)
+                renderer.enabled = false;
+        }
+    }
+
+    private static void RebuildRadarTargets(StartOfRound round, ManualCameraRenderer mapScreen)
+    {
+        mapScreen.radarTargets ??= new List<TransformAndName>();
+        mapScreen.radarTargets.Clear();
+        foreach (PlayerControllerB player in round.allPlayerScripts)
+        {
+            if (player == null)
+                continue;
+            mapScreen.radarTargets.Add(new TransformAndName(player.transform, player.playerUsername));
+        }
+    }
+
+    private static int FindUsableRadarTarget(ManualCameraRenderer mapScreen)
+    {
+        int count = mapScreen.radarTargets.Count;
+        int startIndex = Mathf.Clamp(mapScreen.targetTransformIndex, 0, count - 1);
+        for (int offset = 0; offset < count; offset++)
+        {
+            int index = (startIndex + offset) % count;
+            TransformAndName target = mapScreen.radarTargets[index];
+            if (target != null && target.transform != null)
+                return index;
+        }
+        return 0;
     }
 
     private static void ApplyImmediateLandedState(
@@ -754,9 +946,20 @@ internal static class WorldStateSync
         TerminalAccessibleObject door,
         TerminalDoorSnapshot snapshot)
     {
+        SetField(TerminalDoorOpenField, door, snapshot.IsOpen);
+        SetField(TerminalPoweredField, door, snapshot.IsPoweredOn);
+        SetAnimatedBoolean(
+            door.GetComponent<AnimatedObjectTrigger>(),
+            snapshot.IsOpen || !snapshot.IsPoweredOn);
+
+        if (!HasTerminalMonitorUi(door))
+        {
+            QueueTerminalInitialization(door);
+            return;
+        }
+
         try
         {
-            door.InitializeValues();
             SetField(TerminalPoweredField, door, true);
             SetField(TerminalDoorOpenField, door, !snapshot.IsOpen);
             door.SetDoorOpen(snapshot.IsOpen);
@@ -770,9 +973,96 @@ internal static class WorldStateSync
 
         SetField(TerminalDoorOpenField, door, snapshot.IsOpen);
         SetField(TerminalPoweredField, door, snapshot.IsPoweredOn);
-        SetAnimatedBoolean(
-            door.GetComponent<AnimatedObjectTrigger>(),
-            snapshot.IsOpen || !snapshot.IsPoweredOn);
+    }
+
+    internal static bool ShouldDeferTerminalInitialization(TerminalAccessibleObject door)
+    {
+        if (door == null || !IsLateClient())
+            return false;
+        if (IsTerminalMonitorReady())
+            return false;
+
+        QueueTerminalInitialization(door);
+        return true;
+    }
+
+    private static bool IsLateClient()
+    {
+        var network = NetworkManager.Singleton;
+        return Plugin.Enabled.Value && network != null && network.IsClient && !network.IsServer &&
+               MidJoinState.ClientLateJoinSyncActive;
+    }
+
+    private static bool IsTerminalMonitorReady()
+    {
+        var round = StartOfRound.Instance;
+        return round != null && round.objectCodePrefab != null && round.mapScreen != null &&
+               round.mapScreen.mapCameraStationaryUI != null;
+    }
+
+    private static bool HasTerminalMonitorUi(TerminalAccessibleObject door)
+    {
+        return TerminalMapRadarTextField?.GetValue(door) is UnityEngine.Object text && text != null &&
+               TerminalMapRadarBoxField?.GetValue(door) is UnityEngine.Object box && box != null;
+    }
+
+    private static void QueueTerminalInitialization(TerminalAccessibleObject door)
+    {
+        if (door == null)
+            return;
+
+        int instanceId = door.GetInstanceID();
+        if (!DeferredTerminalInitializations.Add(instanceId))
+            return;
+
+        var network = NetworkManager.Singleton;
+        if (network == null)
+        {
+            DeferredTerminalInitializations.Remove(instanceId);
+            return;
+        }
+
+        network.StartCoroutine(InitializeTerminalWhenReady(door, instanceId));
+    }
+
+    private static IEnumerator InitializeTerminalWhenReady(
+        TerminalAccessibleObject door,
+        int instanceId)
+    {
+        float deadline = Time.realtimeSinceStartup + APPLY_TIMEOUT_SECONDS;
+        while (door != null && !IsTerminalMonitorReady() &&
+               Time.realtimeSinceStartup < deadline)
+            yield return null;
+
+        if (door == null || !IsTerminalMonitorReady())
+        {
+            DeferredTerminalInitializations.Remove(instanceId);
+            yield break;
+        }
+
+        try
+        {
+            if (!HasTerminalMonitorUi(door))
+            {
+                SetField(TerminalInitializedValuesField, door, false);
+                door.InitializeValues();
+            }
+
+            if (HasTerminalMonitorUi(door))
+            {
+                bool poweredOn = ReadField(TerminalPoweredField, door, true);
+                door.OnPowerSwitch(poweredOn);
+                Plugin.Debug($"Initialized deferred secure-door monitor UI at {door.transform.position}.");
+            }
+        }
+        catch (Exception ex)
+        {
+            Plugin.Debug($"Deferred secure-door monitor initialization failed: {ex.Message}");
+        }
+        finally
+        {
+            DeferredTerminalInitializations.Remove(instanceId);
+        }
     }
 
     private static void SetAnimatedBoolean(AnimatedObjectTrigger? animated, bool value)
@@ -949,6 +1239,20 @@ internal static class WorldStateSync
         try
         {
             return field.GetValue(target) is bool value ? value : fallback;
+        }
+        catch
+        {
+            return fallback;
+        }
+    }
+
+    private static T ReadField<T>(FieldInfo? field, object target, T fallback)
+    {
+        if (field == null)
+            return fallback;
+        try
+        {
+            return field.GetValue(target) is T value ? value : fallback;
         }
         catch
         {

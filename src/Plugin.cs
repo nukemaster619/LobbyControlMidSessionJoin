@@ -10,9 +10,9 @@ namespace LobbyControlMidSessionJoin;
 public sealed class Plugin : BaseUnityPlugin
 {
     internal static Plugin Instance = null!;
-    public const string Guid = "amevirus.LobbyControlMidSessionJoin";
+    public const string Guid = "nukemaster619.LobbyControlMidSessionJoin";
     public const string Name = "LobbyControl Mid-Session Join";
-    public const string Version = "0.3.5";
+    public const string Version = "0.4.0";
 
     internal static ManualLogSource Log = null!;
     internal static ConfigEntry<bool> Enabled = null!;
