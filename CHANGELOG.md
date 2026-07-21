@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.4.1]
+
+### Fixed
+
+- Updated the LobbyControl compatibility dependency to 2.5.12.
+- Fixed broken Weather Sync.
+
 ## [0.3.7 - 0.4.0]
 
 ### Fixed

@@ -12,7 +12,7 @@ public sealed class Plugin : BaseUnityPlugin
     internal static Plugin Instance = null!;
     public const string Guid = "nukemaster619.LobbyControlMidSessionJoin";
     public const string Name = "LobbyControl Mid-Session Join";
-    public const string Version = "0.4.0";
+    public const string Version = "0.4.1";
 
     internal static ManualLogSource Log = null!;
     internal static ConfigEntry<bool> Enabled = null!;

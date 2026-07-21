@@ -12,9 +12,9 @@ namespace LobbyControlMidSessionJoin;
 
 internal static class WorldStateSync
 {
-    private const string MESSAGE_NAME = "LobbyControlMidSessionJoin.WorldState.v2";
+    private const string MESSAGE_NAME = "LobbyControlMidSessionJoin.WorldState.v3";
     private const string ACK_MESSAGE_NAME = "LobbyControlMidSessionJoin.WorldStateAck.v1";
-    private const int MESSAGE_VERSION = 2;
+    private const int MESSAGE_VERSION = 3;
     private const float OBJECT_MATCH_DISTANCE = 0.75f;
     private const float APPLY_TIMEOUT_SECONDS = 15f;
     private const BindingFlags INSTANCE_FIELD_FLAGS =
@@ -22,6 +22,13 @@ internal static class WorldStateSync
 
     private static readonly FieldInfo? ShipTravelCoroutineField =
         FindInstanceField(typeof(StartOfRound), "shipTravelCoroutine");
+    private static readonly MethodInfo? SetWeatherEffectsMethod =
+        typeof(TimeOfDay).GetMethod(
+            "SetWeatherEffects",
+            BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic,
+            null,
+            Type.EmptyTypes,
+            null);
     private static readonly FieldInfo? DoorIsOpenedField =
         FindInstanceField(typeof(DoorLock), "isDoorOpened");
     private static readonly FieldInfo? TerminalDoorOpenField =
@@ -205,7 +212,7 @@ internal static class WorldStateSync
             $"Sent {(includeInterior ? "complete" : "ship-only")} world snapshot to client {clientId}: " +
             $"doors={snapshot.Doors.Count}, terminalDoors={snapshot.TerminalDoors.Count}, " +
             $"power={snapshot.PowerOn}, permanentPowerLoss={snapshot.PowerOffPermanently}, " +
-            $"landed={snapshot.ShipHasLanded}");
+            $"weather={(LevelWeatherType)snapshot.CurrentWeather}, landed={snapshot.ShipHasLanded}");
     }
 
     private static WorldSnapshot CaptureSnapshot(bool includeInterior)
@@ -241,6 +248,7 @@ internal static class WorldStateSync
             PowerOffPermanently = powerOffPermanently,
             PowerOn = manager != null && !powerOffPermanently &&
                       (breaker == null || breaker.isPowerOn),
+            CurrentWeather = (int)round.currentLevel.currentWeather,
             ShipTransform = CaptureTransform(round.shipAnimatorObject != null
                 ? round.shipAnimatorObject.transform
                 : round.elevatorTransform),
@@ -452,6 +460,7 @@ internal static class WorldStateSync
             yield return null;
         }
 
+        ApplyWeatherState(snapshot);
         ApplyShipState(
             snapshot,
             moveLocalPlayer: !MidJoinState.ClientPlayerPositioned,
@@ -482,16 +491,81 @@ internal static class WorldStateSync
         {
             ApplyInteriorState(snapshot);
             yield return StabilizePowerState(snapshot);
+            yield return StabilizeWeatherState(snapshot);
             MidJoinState.ClientLateJoinSyncCompleted = true;
             MidJoinState.ClientLateJoinSyncActive = false;
             ApplyShipState(snapshot, moveLocalPlayer: false, holdAnimations: false);
         }
 
         MidJoinState.LastStatus = snapshot.IncludeInterior
-            ? "Applied ship, door, lock, and facility-power snapshot."
+            ? "Applied ship, weather, door, lock, and facility-power snapshot."
             : "Applied landed ship snapshot.";
         Plugin.Debug(MidJoinState.LastStatus);
         _applySnapshotCoroutine = null;
+    }
+
+    private static void ApplyWeatherState(WorldSnapshot snapshot)
+    {
+        var round = StartOfRound.Instance;
+        var timeOfDay = TimeOfDay.Instance;
+        if (round?.currentLevel == null || timeOfDay == null)
+            return;
+
+        LevelWeatherType weather = (LevelWeatherType)snapshot.CurrentWeather;
+        round.currentLevel.currentWeather = weather;
+        timeOfDay.currentLevelWeather = weather;
+
+        try
+        {
+            SetWeatherEffectsMethod?.Invoke(timeOfDay, null);
+        }
+        catch (Exception ex)
+        {
+            Plugin.Debug("Could not invoke TimeOfDay.SetWeatherEffects: " + ex.Message);
+        }
+
+        ForceWeatherEffectObjects(timeOfDay, weather);
+
+        Plugin.Debug($"Applied authoritative late-join weather state: {weather}.");
+    }
+
+    private static void ForceWeatherEffectObjects(TimeOfDay timeOfDay, LevelWeatherType weather)
+    {
+        WeatherEffect[] effects = timeOfDay.effects;
+        if (effects == null)
+            return;
+
+        int activeWeatherIndex = (int)weather;
+        for (int i = 0; i < effects.Length; i++)
+        {
+            WeatherEffect effect = effects[i];
+            if (effect == null)
+                continue;
+
+            bool shouldEnable = i == activeWeatherIndex;
+            effect.effectEnabled = shouldEnable;
+            effect.transitioning = false;
+
+            if (effect.effectObject != null && effect.effectObject.activeSelf != shouldEnable)
+                effect.effectObject.SetActive(shouldEnable);
+
+            if (effect.effectPermanentObject != null &&
+                effect.effectPermanentObject.activeSelf != shouldEnable)
+                effect.effectPermanentObject.SetActive(shouldEnable);
+        }
+    }
+
+    private static IEnumerator StabilizeWeatherState(WorldSnapshot snapshot)
+    {
+        float deadline = Time.realtimeSinceStartup + 2f;
+        while (Time.realtimeSinceStartup < deadline)
+        {
+            if (NetworkManager.Singleton == null || !NetworkManager.Singleton.IsClient)
+                yield break;
+
+            ApplyWeatherState(snapshot);
+            yield return new WaitForSecondsRealtime(0.2f);
+        }
     }
 
     private static bool ShouldHoldShipAnimations()
@@ -1290,6 +1364,7 @@ internal static class WorldStateSync
         writer.WriteValueSafe(snapshot.ShipTravelAudioPlaying);
         writer.WriteValueSafe(snapshot.PowerOffPermanently);
         writer.WriteValueSafe(snapshot.PowerOn);
+        writer.WriteValueSafe(snapshot.CurrentWeather);
         WriteTransform(ref writer, snapshot.ShipTransform);
         WriteTransform(ref writer, snapshot.CurrentPlanetTransform);
         writer.WriteValueSafe(snapshot.CurrentPlanetActive);
@@ -1343,6 +1418,7 @@ internal static class WorldStateSync
         reader.ReadValueSafe(out snapshot.ShipTravelAudioPlaying);
         reader.ReadValueSafe(out snapshot.PowerOffPermanently);
         reader.ReadValueSafe(out snapshot.PowerOn);
+        reader.ReadValueSafe(out snapshot.CurrentWeather);
         snapshot.ShipTransform = ReadTransform(ref reader);
         snapshot.CurrentPlanetTransform = ReadTransform(ref reader);
         reader.ReadValueSafe(out snapshot.CurrentPlanetActive);
@@ -1539,6 +1615,7 @@ internal static class WorldStateSync
         internal bool ShipTravelAudioPlaying;
         internal bool PowerOffPermanently;
         internal bool PowerOn;
+        internal int CurrentWeather;
         internal bool CurrentPlanetActive;
         internal bool OuterSpaceSunActive;
         internal bool StarSphereActive;
